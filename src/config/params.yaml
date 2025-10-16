@@ -1,0 +1,8 @@
+default:
+  entry_thr: 0.52
+  exit_thr: 0.50
+  risk_pct: 0.01
+  atr_mult: 2.0
+overrides:
+  NVDA: {entry_thr: 0.54, exit_thr: 0.51, risk_pct: 0.005}
+  MSFT: {entry_thr: 0.54, exit_thr: 0.51, risk_pct: 0.005}

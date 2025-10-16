@@ -1,15 +1,17 @@
+# flows/prefect_nightly.py
 import os, subprocess, datetime as dt, json
+import pandas as pd
 from prefect import flow, task
 from dotenv import load_dotenv
 from src.utils.r2_client import _fs, s3url, list_keys
 
 load_dotenv(override=True)
 
-SYMS = ["AVGO","NVDA","TSLA","IBM","DELL","LLY","AMD","META","AAPL","MSFT","GOOGL","AMZN"]
+SYMS  = ["TSLA", "RKLB", "NVDA"]
 YEARS = ["2018","2019","2020","2021","2022","2023","2024","2025"]
 
-AUTO_TUNE = os.getenv("AUTO_TUNE", "0") == "1"          # set AUTO_TUNE=1 to enable
-N_TRIALS  = int(os.getenv("TUNE_TRIALS", "40"))         # tuning trials if enabled
+AUTO_TUNE = os.getenv("AUTO_TUNE", "0") == "1"
+N_TRIALS  = int(os.getenv("TUNE_TRIALS", "40"))
 
 def sh(cmd: str):
     print("→", cmd)
@@ -46,13 +48,26 @@ def make_labels():
     sh(f"python -m features.make_labels_to_cloud --symbol ALL --symbols-cfg src/config/symbols.yaml --years {yrs} --pt-mult 2.0 --sl-mult 1.0 --max-holding 10")
 
 @task
+def regime_and_aux():
+    yrs = " ".join(YEARS)
+    # HMM (QQQ)
+    sh(f"python -m src.regime.hmm --years {yrs} --push-to-r2")
+    # Kronos + mlforecast per symbol
+    for s in SYMS:
+        sh(f"python -m src.alpha.kronos_signal --symbol {s} --years {yrs} --push-to-r2")
+        sh(f"python -m src.models.mlf_train    --symbol {s} --years {yrs} --push-to-r2")
+
+@task
 def train_all():
     yrs = " ".join(YEARS)
     for s in SYMS:
         print(f"== Train {s} ==")
+        tuned = {}
         if AUTO_TUNE:
             sh(f"python -m src.models.tune_xgb --symbol {s} --years {yrs} --n-trials {N_TRIALS} --min-train-days 252 --min-test-days 30 --drop-zero-labels")
-        tuned = _read_tuned_params_if_any(s) or {}
+            tuned = _read_tuned_params_if_any(s) or {}
+        else:
+            tuned = _read_tuned_params_if_any(s) or {}
         flags = ""
         for k, cli in dict(
             n_estimators="--n-estimators",
@@ -63,7 +78,12 @@ def train_all():
         ).items():
             if k in tuned:
                 flags += f" {cli} {tuned[k]}"
-        sh(f"python -m src.models.xgb_walkforward --symbol {s} --years {yrs} --min-train-days 252 --min-test-days 30 --push-to-r2{flags}")
+        # dual calibration + per-fold scale_pos_weight
+        sh(
+            f"python -m src.models.xgb_walkforward --symbol {s} --years {yrs} "
+            f"--min-train-days 252 --min-test-days 30 --push-to-r2 "
+            f"--scale-pos-weight auto --calibration-dual{flags}"
+        )
 
 @task
 def backtest_all(run_id: str):
@@ -74,20 +94,45 @@ def backtest_all(run_id: str):
             sh(
               f"python -m src.backtest.engine --symbol {s} --years {yrs} "
               f"--run-id {run_id} --commission-per-share 0.0038 --slippage-bps 5 "
-              f"--entry-thr 0.55 --exit-thr 0.50 --risk-pct 0.01 --atr-mult 2.0 --use-next-open --push-to-r2"
+              f"--use-param-cfg src/config/params.yaml --use-next-open "
+              f"--qqq-regime --hmm-regime --push-to-r2"
             )
         except subprocess.CalledProcessError as e:
             print(f"[WARN] backtest failed for {s}: {e}")
 
 @task
-def report_and_push(run_id: str):
-    out_csv = f"backtests/summary_{run_id}.csv"
-    sh(f"python -m src.reporting.make_report --run-id {run_id} --out-csv {out_csv}")
-    # push summary CSV to R2
+def run_portfolio_report(run_id: str):
+    # Generates portfolio_<RUN_ID>.{csv,json} and summary_<RUN_ID>.csv under backtests/analysis/
+    sh(f"python -m src.reporting.eval_suite --run-id {run_id} --enable-hrp --enable-target-vol --target-vol 0.10")
+
+@task
+def push_reports_to_r2(run_id: str):
     fs = _fs()
-    with open(out_csv, "rb") as fin, fs.open(s3url(f"backtests/summary/{run_id}.csv"), "wb") as fout:
-        fout.write(fin.read())
-    print(f"Pushed summary to s3://{os.getenv('R2_BUCKET','quant-ml')}/backtests/summary/{run_id}.csv")
+    # push portfolio csv/json
+    for ext in ("csv","json"):
+        lp = f"backtests/analysis/portfolio_{run_id}.{ext}"
+        if os.path.exists(lp):
+            with open(lp, "rb") as fin, fs.open(s3url(f"backtests/analysis/portfolio_{run_id}.{ext}"), "wb") as fout:
+                fout.write(fin.read())
+            print(f"Pushed {ext.upper()} to R2: {s3url(f'backtests/analysis/portfolio_{run_id}.{ext}')}")
+    # push summary csv (produced by eval_suite)
+    summ_lp = f"backtests/analysis/summary_{run_id}.csv"
+    if os.path.exists(summ_lp):
+        with open(summ_lp, "rb") as fin, fs.open(s3url(f"backtests/analysis/summary_{run_id}.csv"), "wb") as fout:
+            fout.write(fin.read())
+        print(f"Pushed summary to R2: {s3url(f'backtests/analysis/summary_{run_id}.csv')}")
+
+@task
+def print_top5_from_summary(run_id: str):
+    path = f"backtests/analysis/summary_{run_id}.csv"
+    if not os.path.exists(path):
+        print(f"[WARN] summary not found: {path}")
+        return
+    df = pd.read_csv(path)
+    if "sharpe" in df.columns:
+        top5 = df.sort_values("sharpe", ascending=False).head(5)[["symbol","sharpe","cagr","maxdd"]]
+        print("\n== Sharpe Top-5 ==")
+        print(top5.to_string(index=False))
 
 @flow(name="quant-ml-nightly")
 def nightly():
@@ -95,9 +140,17 @@ def nightly():
     ingest()
     make_features()
     make_labels()
+    # Regime (HMM) + Aux predictions
+    regime_and_aux()
+    # XGB training (dual calibration + auto spw)
     train_all()
+    # Backtests with param overrides + gates
     backtest_all(run_id)
-    report_and_push(run_id)
+    # Portfolio + Summary + Push + Console Top-5
+    run_portfolio_report(run_id)
+    push_reports_to_r2(run_id)
+    print_top5_from_summary(run_id)
+    print(f"[DONE] RUN_ID={run_id}")
 
 if __name__ == "__main__":
     nightly()
