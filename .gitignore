@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Data & outputs
+data/
+backtests/out/
+backtests/analysis/
+models/
+features/
+train/
+*.parquet
+*.csv
+*.json
+
+# OS
+.DS_Store
