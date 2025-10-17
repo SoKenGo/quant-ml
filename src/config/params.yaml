@@ -1,8 +1,20 @@
+# Prefer tuned thresholds/params; YAML values are FALLBACKS only.
+tuning:
+  enabled: true
+  sources: ["r2", "local", "yaml_default"]  # lookup order for tuned artifacts
+
+# Execution / data context
+timeframe: "1h"
+
+# Fallbacks used ONLY if no tuned artifact is found for a symbol
 default:
   entry_thr: 0.52
   exit_thr: 0.50
   risk_pct: 0.01
   atr_mult: 2.0
+
+# Keep only the three symbols; leave empty to avoid hardcoding per-symbol params.
 overrides:
-  NVDA: {entry_thr: 0.54, exit_thr: 0.51, risk_pct: 0.005}
-  MSFT: {entry_thr: 0.54, exit_thr: 0.51, risk_pct: 0.005}
+  NVDA: {}
+  TSLA: {}
+  RKLB: {}

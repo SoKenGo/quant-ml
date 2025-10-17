@@ -1,0 +1,12 @@
+hp: !!python/object:__main__.HParams
+  batch_size: 256
+  d_model: 256
+  depth: 4
+  dropout: 0.1
+  lookback: 96
+  lr: 0.001
+  max_epochs: 1
+  n_heads: 8
+  patch_len: 16
+  patience: 3
+in_ch: 12
